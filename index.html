@@ -2240,31 +2240,64 @@ printOrc = function(){ setTimeout(()=>window.print(),100); };
 
 
 // ══════════════════════════════════════════════════════
-//  SUPABASE — BANCO REAL + SINCRONIZAÇÃO ENTRE DISPOSITIVOS
+//  SUPABASE — BANCO REAL + SINCRONIZAÇÃO SEGURA ENTRE DISPOSITIVOS
+//  v18.2: carrega a nuvem primeiro e bloqueia sobrescrita por localStorage antigo
 // ══════════════════════════════════════════════════════
 const SUPABASE_URL = 'https://almulgemeabjquflqdbb.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_k0COuRkObrz7bSeSTYGm5g_GACYJJBK';
 const CLOUD_ROW_ID = 'main';
+
 let sbClient = null;
 let cloudSavingTimer = null;
-let cloudReady = false;
+let cloudReady = false;          // só vira true depois de carregar o Supabase
+let cloudLoadedOnce = false;     // evita salvar localStorage antigo antes do primeiro load
 let applyingCloud = false;
+let cloudLastLoadedAt = null;
 
 function cloudStatus(msg, ok=true){
   let el=document.getElementById('cloud-status');
-  if(!el){
-    const top=document.querySelector('.topbar > div:last-child');
-    if(top){
-      el=document.createElement('button');
-      el.id='cloud-status';
-      el.type='button';
-      el.className='btn btn-gh btn-sm';
-      el.style.fontSize='11px';
-      el.style.padding='5px 8px';
-      el.onclick=()=>cloudLoad(true);
-      top.prepend(el);
-    }
+  let btnReload=document.getElementById('cloud-reload');
+  let btnSave=document.getElementById('cloud-save');
+  const top=document.querySelector('.topbar > div:last-child');
+
+  if(!el && top){
+    el=document.createElement('button');
+    el.id='cloud-status';
+    el.type='button';
+    el.className='btn btn-gh btn-sm';
+    el.style.fontSize='11px';
+    el.style.padding='5px 8px';
+    el.title='Status da sincronização com o Supabase';
+    el.onclick=()=>cloudLoad(true);
+    top.prepend(el);
   }
+
+  if(!btnReload && top){
+    btnReload=document.createElement('button');
+    btnReload.id='cloud-reload';
+    btnReload.type='button';
+    btnReload.className='btn btn-gh btn-sm';
+    btnReload.style.fontSize='11px';
+    btnReload.style.padding='5px 8px';
+    btnReload.textContent='↻ Nuvem';
+    btnReload.title='Recarregar dados do Supabase';
+    btnReload.onclick=()=>cloudLoad(true);
+    top.insertBefore(btnReload, el ? el.nextSibling : top.firstChild);
+  }
+
+  if(!btnSave && top){
+    btnSave=document.createElement('button');
+    btnSave.id='cloud-save';
+    btnSave.type='button';
+    btnSave.className='btn btn-g btn-sm';
+    btnSave.style.fontSize='11px';
+    btnSave.style.padding='5px 8px';
+    btnSave.textContent='Salvar nuvem';
+    btnSave.title='Salvar manualmente no Supabase';
+    btnSave.onclick=()=>cloudManualSave();
+    top.insertBefore(btnSave, btnReload ? btnReload.nextSibling : top.firstChild);
+  }
+
   if(el){
     el.textContent=msg;
     el.style.borderColor=ok?'#86efac':'#fecaca';
@@ -2274,92 +2307,185 @@ function cloudStatus(msg, ok=true){
 
 function cloudSnapshot(){
   return {
-    v:5,
+    v:6,
     updatedAt:new Date().toISOString(),
-    REC:REC||[],
-    DES:DES||[],
-    ORC_LIST:ORC_LIST||[],
-    PROD:PROD||[],
-    FIX:FIX||[],
-    PRODUTOS_PRECO:PRODUTOS_PRECO||[]
+    REC:Array.isArray(REC)?REC:[],
+    DES:Array.isArray(DES)?DES:[],
+    ORC_LIST:Array.isArray(ORC_LIST)?ORC_LIST:[],
+    PROD:Array.isArray(PROD)?PROD:[],
+    FIX:Array.isArray(FIX)?FIX:[],
+    PRODUTOS_PRECO:Array.isArray(PRODUTOS_PRECO)?PRODUTOS_PRECO:[],
+    REQ_MAT:(typeof REQ_MAT !== 'undefined' && Array.isArray(REQ_MAT))?REQ_MAT:[]
   };
 }
 
+function cloudHasRealData(data){
+  if(!data || typeof data!=='object') return false;
+  const keys=['REC','DES','ORC_LIST','PROD','FIX','PRODUTOS_PRECO','REQ_MAT'];
+  return keys.some(k=>Array.isArray(data[k]) && data[k].length>0);
+}
+
 function persistLocalOnly(){
-  localStorage.setItem('rc4r',JSON.stringify(REC||[]));
-  localStorage.setItem('rc4d',JSON.stringify(DES||[]));
-  localStorage.setItem('rc4orc',JSON.stringify(ORC_LIST||[]));
-  localStorage.setItem('rc4prod',JSON.stringify(PROD||[]));
-  localStorage.setItem('rc4fix',JSON.stringify(FIX||[]));
-  localStorage.setItem('rc4produtosPreco',JSON.stringify(PRODUTOS_PRECO||[]));
+  try{
+    localStorage.setItem('rc4r',JSON.stringify(Array.isArray(REC)?REC:[]));
+    localStorage.setItem('rc4d',JSON.stringify(Array.isArray(DES)?DES:[]));
+    localStorage.setItem('rc4orc',JSON.stringify(Array.isArray(ORC_LIST)?ORC_LIST:[]));
+    localStorage.setItem('rc4prod',JSON.stringify(Array.isArray(PROD)?PROD:[]));
+    localStorage.setItem('rc4fix',JSON.stringify(Array.isArray(FIX)?FIX:[]));
+    localStorage.setItem('rc4produtosPreco',JSON.stringify(Array.isArray(PRODUTOS_PRECO)?PRODUTOS_PRECO:[]));
+    if(typeof REQ_MAT!=='undefined') localStorage.setItem('rc4reqmat',JSON.stringify(Array.isArray(REQ_MAT)?REQ_MAT:[]));
+  }catch(e){ console.warn('persistLocalOnly',e); }
+}
+
+function refreshAfterCloud(){
+  try{
+    if(typeof buildGrupoSelects==='function') buildGrupoSelects();
+    if(typeof updSubRec==='function') updSubRec();
+    if(typeof updSubDesp==='function') updSubDesp();
+    if(typeof buildFiltroGrupo==='function') buildFiltroGrupo();
+    if(typeof renFix==='function') renFix();
+    if(typeof renCfg==='function') renCfg();
+    if(typeof gerarNumOrc==='function') gerarNumOrc();
+    if(typeof upAll==='function') upAll();
+    if(typeof renderProdPrecoCfg==='function') renderProdPrecoCfg();
+    if(typeof renReqMat==='function') renReqMat();
+  }catch(e){ console.warn('refresh after cloud',e); }
 }
 
 function applyCloudData(data){
-  if(!data) return;
+  if(!data || typeof data!=='object') return;
   applyingCloud=true;
+
   REC=Array.isArray(data.REC)?data.REC:[];
   DES=Array.isArray(data.DES)?data.DES:[];
   ORC_LIST=Array.isArray(data.ORC_LIST)?data.ORC_LIST:[];
   PROD=Array.isArray(data.PROD)?data.PROD:[];
   FIX=Array.isArray(data.FIX)?data.FIX:FIX;
   PRODUTOS_PRECO=Array.isArray(data.PRODUTOS_PRECO)?data.PRODUTOS_PRECO:(PRODUTOS_PRECO||[]);
-  normalizarDadosDRE();
+  if(typeof REQ_MAT!=='undefined') REQ_MAT=Array.isArray(data.REQ_MAT)?data.REQ_MAT:(REQ_MAT||[]);
+
+  if(typeof normalizarDadosDRE==='function') normalizarDadosDRE();
   persistLocalOnly();
-  try{
-    buildGrupoSelects(); updSubRec(); updSubDesp(); buildFiltroGrupo(); renFix(); renCfg(); gerarNumOrc(); upAll();
-    if(typeof renderProdPrecoCfg==='function') renderProdPrecoCfg();
-  }catch(e){ console.warn('refresh after cloud',e); }
+  refreshAfterCloud();
+
   applyingCloud=false;
 }
 
 function initSupabaseClient(){
   if(sbClient) return sbClient;
-  if(!window.supabase){ cloudStatus('☁️ Supabase CDN erro', false); return null; }
+  if(!window.supabase){
+    cloudStatus('☁️ Supabase CDN erro', false);
+    return null;
+  }
   sbClient=window.supabase.createClient(SUPABASE_URL,SUPABASE_KEY);
   return sbClient;
 }
 
 async function cloudLoad(showToast=false){
-  const sb=initSupabaseClient(); if(!sb) return;
-  cloudStatus('☁️ Sincronizando...', true);
+  const sb=initSupabaseClient();
+  if(!sb) return;
+
+  cloudStatus('☁️ Carregando nuvem...', true);
+
   try{
-    const {data,error}=await sb.from('rc_app_state').select('id,data,updated_at').eq('id',CLOUD_ROW_ID).maybeSingle();
+    const {data,error}=await sb
+      .from('rc_app_state')
+      .select('id,data,updated_at')
+      .eq('id',CLOUD_ROW_ID)
+      .maybeSingle();
+
     if(error) throw error;
-    if(data && data.data){
+
+    if(data && data.data && cloudHasRealData(data.data)){
       applyCloudData(data.data);
       cloudReady=true;
+      cloudLoadedOnce=true;
+      cloudLastLoadedAt=data.updated_at||null;
       cloudStatus('☁️ Online', true);
-      if(showToast) toast('Dados sincronizados com o banco ✓');
-    }else{
-      await cloudSaveNow();
-      cloudReady=true;
-      cloudStatus('☁️ Online', true);
-      if(showToast) toast('Banco iniciado com os dados atuais ✓');
+      if(showToast) toast('Dados carregados da nuvem ✓');
+      return;
     }
+
+    // Segurança: não gravar localStorage antigo automaticamente em banco vazio.
+    cloudReady=true;
+    cloudLoadedOnce=true;
+    cloudStatus('☁️ Banco vazio', false);
+    if(showToast) toast('Banco vazio. Cadastre dados e clique em Salvar nuvem.');
   }catch(e){
     console.error('cloudLoad',e);
-    cloudStatus('☁️ Banco não configurado', false);
-    if(showToast) toast('Erro no banco: execute o SQL no Supabase.');
+    cloudReady=false;
+    cloudLoadedOnce=false;
+    cloudStatus('☁️ Erro na nuvem', false);
+    if(showToast) toast('Erro ao carregar Supabase.');
   }
 }
 
-async function cloudSaveNow(){
+async function cloudSaveNow(force=false){
   if(applyingCloud) return;
-  const sb=initSupabaseClient(); if(!sb) return;
-  const payload={id:CLOUD_ROW_ID,data:cloudSnapshot(),updated_at:new Date().toISOString()};
+  const sb=initSupabaseClient();
+  if(!sb) return;
+
+  // Proteção principal: nunca salvar antes do primeiro carregamento da nuvem.
+  if(!force && (!cloudReady || !cloudLoadedOnce)){
+    cloudStatus('☁️ Aguardando nuvem', false);
+    return;
+  }
+
+  const snapshot=cloudSnapshot();
+
+  // Proteção contra snapshot vazio/acidental.
+  if(!force && !cloudHasRealData(snapshot)){
+    cloudStatus('☁️ Nada para salvar', false);
+    console.warn('Bloqueado: tentativa de salvar snapshot vazio no Supabase.');
+    return;
+  }
+
+  const payload={
+    id:CLOUD_ROW_ID,
+    data:snapshot,
+    updated_at:new Date().toISOString()
+  };
+
   const {error}=await sb.from('rc_app_state').upsert(payload,{onConflict:'id'});
   if(error) throw error;
+
   cloudReady=true;
+  cloudLoadedOnce=true;
   cloudStatus('☁️ Salvo', true);
 }
 
 function cloudQueueSave(){
   if(applyingCloud) return;
+
+  // Antes de carregar a nuvem, salva apenas local. Isso impede sobrescrita por cache antigo.
+  if(!cloudReady || !cloudLoadedOnce){
+    persistLocalOnly();
+    cloudStatus('☁️ Aguardando nuvem', false);
+    return;
+  }
+
   clearTimeout(cloudSavingTimer);
   cloudSavingTimer=setTimeout(async()=>{
-    try{ cloudStatus('☁️ Salvando...', true); await cloudSaveNow(); }
-    catch(e){ console.error('cloudSave',e); cloudStatus('☁️ Erro ao salvar', false); }
+    try{
+      cloudStatus('☁️ Salvando...', true);
+      await cloudSaveNow(false);
+    }catch(e){
+      console.error('cloudSave',e);
+      cloudStatus('☁️ Erro ao salvar', false);
+    }
   },650);
+}
+
+async function cloudManualSave(){
+  try{
+    cloudStatus('☁️ Salvando...', true);
+    await cloudSaveNow(true);
+    toast('Salvo manualmente na nuvem ✓');
+  }catch(e){
+    console.error('cloudManualSave',e);
+    cloudStatus('☁️ Erro ao salvar', false);
+    toast('Erro ao salvar na nuvem.');
+  }
 }
 
 const saveBeforeCloud = save;
@@ -2371,7 +2497,9 @@ save = function(){
 const checkPINBeforeCloud = checkPIN;
 checkPIN = function(){
   checkPINBeforeCloud();
-  if(sessionStorage.getItem('rc_pin_ok')==='1') setTimeout(()=>cloudLoad(true),250);
+  if(sessionStorage.getItem('rc_pin_ok')==='1'){
+    setTimeout(()=>cloudLoad(true),250);
+  }
 };
 
 window.addEventListener('DOMContentLoaded',()=>{
@@ -2380,7 +2508,6 @@ window.addEventListener('DOMContentLoaded',()=>{
     if(sessionStorage.getItem('rc_pin_ok')==='1') cloudLoad(false);
   },700);
 });
-
 
 // ══════════════════════════════════════════════════════
 //  V16.1 — AJUSTES SOLICITADOS: ORÇAMENTO, PRODUÇÃO, FILTROS E REQUISIÇÃO DE MATERIAIS
