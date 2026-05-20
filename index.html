@@ -2514,6 +2514,237 @@ G = function(p){ ensureV161UI(); GV16(p); if(p==='req'){ renReqOptions(); docume
 window.addEventListener('DOMContentLoaded',()=>setTimeout(ensureV161UI,900));
 
 
+
+// ══════════════════════════════════════════════════════
+//  V18.1 — CORREÇÕES CIRÚRGICAS: REQUISIÇÃO, PRINT, APROVAÇÃO E PROTEÇÃO CLOUD
+// ══════════════════════════════════════════════════════
+
+// Evita que uma sessão/localStorage vazio ou antigo salve antes da nuvem carregar
+let CLOUD_LOAD_FINISHED_V18 = false;
+const cloudLoadV18Safe = cloudLoad;
+cloudLoad = async function(showToast=false){
+  await cloudLoadV18Safe(showToast);
+  CLOUD_LOAD_FINISHED_V18 = true;
+};
+
+// Proteção extra: nunca salva snapshot vazio/sem dados reais por cima da nuvem
+const cloudSaveNowV18Safe = cloudSaveNow;
+cloudSaveNow = async function(){
+  const snap = cloudSnapshot();
+  const totalRegs = (snap.REC||[]).length + (snap.DES||[]).length + (snap.ORC_LIST||[]).length + (snap.PROD||[]).length + (snap.REQ_MAT||[]).length;
+  if(!CLOUD_LOAD_FINISHED_V18 && totalRegs===0){
+    console.warn('Proteção cloud: bloqueado salvar snapshot vazio antes do carregamento da nuvem.');
+    cloudStatus('☁️ Aguardando nuvem', true);
+    return;
+  }
+  return cloudSaveNowV18Safe();
+};
+
+const cloudQueueSaveV18Safe = cloudQueueSave;
+cloudQueueSave = function(){
+  const snap = cloudSnapshot();
+  const totalRegs = (snap.REC||[]).length + (snap.DES||[]).length + (snap.ORC_LIST||[]).length + (snap.PROD||[]).length + (snap.REQ_MAT||[]).length;
+  if(!CLOUD_LOAD_FINISHED_V18 && totalRegs===0){
+    console.warn('Proteção cloud: fila de salvamento bloqueada antes da nuvem carregar.');
+    return;
+  }
+  cloudQueueSaveV18Safe();
+};
+
+// Garante que orçamento só gera financeiro/produção/requisição depois da aprovação
+const gerarVendaDeOrcV18Guard = gerarVendaDeOrc;
+gerarVendaDeOrc = function(o){
+  if(!o || o.status !== 'Aprovado') return;
+  if(REC.find(r=>r.geradoDeOrc===o.id)) return;
+  gerarVendaDeOrcV18Guard(o);
+};
+
+const gerarProdDeOrcV18Guard = gerarProdDeOrc;
+gerarProdDeOrc = function(o){
+  if(!o || o.status !== 'Aprovado') return;
+  if(PROD.find(p=>p.orcId===o.id)){
+    criarReqMatDeOrc(o);
+    return;
+  }
+  gerarProdDeOrcV18Guard(o);
+};
+
+salvarStatusOrc = function(){
+  const o=ORC_LIST.find(x=>x.id===statusOrcId); if(!o) return;
+  const novoSt=document.getElementById('ov-orc-st').value;
+  o.status=novoSt;
+  o.dtStatus=today();
+  o.obsStatus=document.getElementById('ov-orc-obs').value;
+  if(novoSt==='Aprovado'){
+    o.dtEntrega=document.getElementById('ov-entrega-dt').value;
+    gerarVendaDeOrc(o);
+    gerarProdDeOrc(o);
+    criarReqMatDeOrc(o);
+  }else{
+    // Se voltou para pendente/reprovado, remove vínculos operacionais para não poluir financeiro/produção
+    REC=REC.filter(r=>r.geradoDeOrc!==o.id);
+    PROD=PROD.filter(p=>p.orcId!==o.id);
+    REQ_MAT=REQ_MAT.filter(r=>r.orcId!==o.id);
+  }
+  save(); closeOv('ov-orc-status'); renOrcList(); renProd(); renReqOptions(); upAll();
+  toast(novoSt==='Aprovado'?'✅ Aprovado! Financeiro, produção e requisição gerados.':novoSt==='Reprovado'?'❌ Orçamento reprovado e removido da produção.':'Status atualizado.');
+};
+
+// Campos da requisição não re-renderizam a cada caractere, evitando travar digitação
+function setReqField(k,v){
+  const r=getReqAtual(); if(!r) return;
+  r[k]=v;
+  persistReqLocal();
+  cloudQueueSave();
+}
+function setReqItem(i,k,v){
+  const r=getReqAtual(); if(!r || !r.itens || !r.itens[i]) return;
+  r.itens[i][k]=v;
+  persistReqLocal();
+  cloudQueueSave();
+}
+function setReqItemAndRefresh(i,k,v){
+  setReqItem(i,k,v);
+  const r=getReqAtual(); renderReqMat(r,false);
+}
+
+function reqEsc(v){
+  return String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+renderReqMat = function(r,keepFocus=true){
+  const box=document.getElementById('req-print-area'); if(!box) return;
+  if(!r){ box.innerHTML='<div style="padding:20px;color:#94a3b8">Aprove um orçamento para gerar uma requisição de materiais automaticamente.</div>'; return; }
+  if(!Array.isArray(r.itens)) r.itens=[];
+  while(r.itens.length<18) r.itens.push({desc:'',un:'UN/M²',qtd:'',custo:'',forn:'',ok:false});
+  const tMat=totalReq(r), val=parseFloat(r.valorProjeto)||0, outros=parseFloat(r.outrosCustos)||0, lucro=val-tMat-outros, margem=val?lucro/val*100:0, markup=(tMat+outros)>0?((val/(tMat+outros))-1)*100:0;
+
+  const rows=(r.itens||[]).map((it,i)=>`
+    <tr>
+      <td class="req-col-num">${i+1}</td>
+      <td class="req-col-desc"><textarea rows="1" oninput="setReqItem(${i},'desc',this.value)" onchange="renderReqMat(getReqAtual(),false)" placeholder="Descrição completa do material">${reqEsc(it.desc||'')}</textarea></td>
+      <td class="req-col-un"><input value="${reqEsc(it.un||'')}" oninput="setReqItem(${i},'un',this.value)" placeholder="UN/M²"></td>
+      <td class="req-col-qtd"><input type="number" step="0.01" value="${reqEsc(it.qtd||'')}" oninput="setReqItem(${i},'qtd',this.value)" onchange="renderReqMat(getReqAtual(),false)"></td>
+      <td class="req-col-custo"><input type="number" step="0.01" value="${reqEsc(it.custo||'')}" oninput="setReqItem(${i},'custo',this.value)" onchange="renderReqMat(getReqAtual(),false)"></td>
+      <td class="req-col-forn"><input value="${reqEsc(it.forn||'')}" oninput="setReqItem(${i},'forn',this.value)" placeholder="Fornecedor"></td>
+      <td class="req-col-total">${fm((parseFloat(it.qtd)||0)*(parseFloat(it.custo)||0))}</td>
+      <td class="req-col-ok"><input type="checkbox" ${it.ok?'checked':''} onchange="setReqItemAndRefresh(${i},'ok',this.checked)"></td>
+    </tr>`).join('');
+
+  box.innerHTML=`<div class="req-doc">
+    <div class="req-head-main">RC COMUNICAÇÃO VISUAL</div>
+    <div class="req-head-sub">CNPJ: 61.457.178/0001-50 · R. Castro Alves, 170 – Jardim Limoeiro, Serra/ES · (27) 9974-7872</div>
+    <div class="req-print-title">🔧 REQUISIÇÃO DE MATERIAIS PARA PRODUÇÃO</div>
+    <table class="req-table req-project-table">
+      <tr><th colspan="8" class="req-section-title">DADOS DO PROJETO</th></tr>
+      <tr>
+        <td colspan="2"><b>Nº Pedido/Orçamento:</b></td><td colspan="2"><input value="${reqEsc(r.num||'')}" oninput="setReqField('num',this.value)"></td>
+        <td><b>Data:</b></td><td><input type="date" value="${reqEsc(r.dt||'')}" oninput="setReqField('dt',this.value)"></td>
+        <td><b>Prazo:</b></td><td><input type="date" value="${reqEsc(r.prazo||'')}" oninput="setReqField('prazo',this.value)"></td>
+      </tr>
+      <tr><td colspan="2"><b>Cliente:</b></td><td colspan="6"><input value="${reqEsc(r.cli||'')}" oninput="setReqField('cli',this.value)"></td></tr>
+      <tr><td colspan="2"><b>Tipo de Projeto:</b></td><td colspan="4"><input value="${reqEsc(r.projeto||'')}" oninput="setReqField('projeto',this.value)"></td><td><b>Local:</b></td><td><input value="${reqEsc(r.local||'')}" oninput="setReqField('local',this.value)"></td></tr>
+      <tr><td colspan="2"><b>Descrição/Obs.:</b></td><td colspan="6"><textarea rows="3" oninput="setReqField('obs',this.value)">${reqEsc(r.obs||'')}</textarea></td></tr>
+    </table>
+    <table class="req-table req-material-table">
+      <colgroup>
+        <col style="width:3%">
+        <col style="width:34%">
+        <col style="width:9%">
+        <col style="width:9%">
+        <col style="width:12%">
+        <col style="width:18%">
+        <col style="width:11%">
+        <col style="width:4%">
+      </colgroup>
+      <tr><th colspan="8" class="req-section-title">📋 LISTA DE MATERIAIS NECESSÁRIOS</th></tr>
+      <tr><th>#</th><th>Descrição do material</th><th>Unid.</th><th>Qtd.</th><th>Custo Unit. (R$)</th><th>Fornecedor</th><th>Total</th><th>✓</th></tr>
+      ${rows}
+      <tr class="req-total-row"><td colspan="6">💰 TOTAL DE CUSTOS COM MATERIAIS:</td><td>${fm(tMat)}</td><td></td></tr>
+    </table>
+    <table class="req-table req-fin-table">
+      <tr><th colspan="8" class="req-section-title">📊 ANÁLISE FINANCEIRA DO PROJETO</th></tr>
+      <tr class="req-fin-row"><td colspan="5">💵 VALOR TOTAL DO PROJETO (Receita):</td><td colspan="3"><input type="number" step="0.01" value="${r.valorProjeto||0}" oninput="setReqField('valorProjeto',parseFloat(this.value)||0)" onchange="renderReqMat(getReqAtual(),false)"></td></tr>
+      <tr class="req-fin-row"><td colspan="5">🔻 (-) Custo Total dos Materiais:</td><td colspan="3">${fm(tMat)}</td></tr>
+      <tr class="req-fin-row"><td colspan="5">🔻 (-) Outros Custos (mão-de-obra, frete, terceirização):</td><td colspan="3"><input type="number" step="0.01" value="${r.outrosCustos||0}" oninput="setReqField('outrosCustos',parseFloat(this.value)||0)" onchange="renderReqMat(getReqAtual(),false)"></td></tr>
+      <tr class="req-fin-row"><td colspan="5" class="req-profit">✅ LUCRO BRUTO DO PROJETO:</td><td colspan="3" class="req-profit">${fm(lucro)}</td></tr>
+      <tr class="req-fin-row"><td colspan="5">📈 MARGEM DE LUCRO BRUTA (%):</td><td colspan="3">${margem.toFixed(1)}%</td></tr>
+      <tr class="req-fin-row"><td colspan="5">🔁 MARKUP s/ Custos:</td><td colspan="3">${markup.toFixed(1)}%</td></tr>
+    </table>
+    <div class="req-sign"><div>_____________________________<br>${reqEsc(r.responsavel||'Responsável pela Produção')}</div><div>_____________________________<br>RC COMUNICAÇÃO VISUAL<br>(Cristiano Bernardo Jorge)</div></div>
+  </div>`;
+};
+
+function reqPrintCss(){
+  return `
+    @page{size:A4 landscape;margin:8mm}
+    *{box-sizing:border-box;-webkit-print-color-adjust:exact!important;print-color-adjust:exact!important}
+    body{font-family:Arial,sans-serif;margin:0;color:#111827;background:#fff}
+    .req-doc{width:100%;font-size:11px}
+    .req-head-main{background:#1e2a3a!important;color:#fff!important;padding:14px 18px;font-size:24px;font-weight:800}
+    .req-head-sub{background:#1e2a3a!important;color:#fff!important;border-top:8px solid #fff;padding:7px 18px;font-size:11px}
+    .req-print-title{background:#e63946!important;color:#fff!important;text-align:center;font-weight:800;padding:10px;font-size:15px;margin:10px 0}
+    .req-table{width:100%;border-collapse:collapse;margin-top:8px;table-layout:fixed}
+    .req-table th{background:#1e2a3a!important;color:#fff!important;padding:7px 6px;border:1px solid #1e2a3a;text-align:center;font-size:10px;text-transform:uppercase;letter-spacing:.04em}
+    .req-table td{border:1px solid #e2e8f0;padding:5px 6px;vertical-align:middle}
+    .req-section-title{text-align:left!important}
+    .req-table input,.req-table textarea{width:100%;border:1px solid #cbd5e1;border-radius:4px;padding:5px 6px;font-size:11px;font-family:Arial,sans-serif;background:#fff;color:#111827;min-height:24px}
+    .req-table textarea{resize:vertical;overflow:hidden;white-space:pre-wrap}
+    .req-col-num,.req-col-ok{text-align:center}
+    .req-col-total{text-align:right;font-weight:700;white-space:nowrap}
+    .req-total-row td{background:#1e2a3a!important;color:#fff!important;font-weight:800!important;text-align:right}
+    .req-fin-row td:first-child{font-weight:700;background:#f8fafc!important}
+    .req-fin-row td:last-child{text-align:right;font-weight:800}
+    .req-profit{background:#16a34a!important;color:#fff!important;font-weight:800!important}
+    .req-sign{display:flex;justify-content:space-around;margin-top:28px;text-align:center;font-size:11px}
+    .req-no-print{display:none!important}
+    @media print{
+      html,body{width:297mm}
+      .req-doc{page-break-inside:auto}
+      .req-material-table tr{page-break-inside:avoid}
+    }`;
+}
+
+printReqMat = function(){
+  const html=document.getElementById('req-print-area')?.innerHTML||''; if(!html) return;
+  const oldTitle=document.title; document.title='Requisição de Materiais';
+  const iframe=document.createElement('iframe');
+  iframe.style.position='fixed'; iframe.style.right='0'; iframe.style.bottom='0'; iframe.style.width='0'; iframe.style.height='0'; iframe.style.border='0';
+  document.body.appendChild(iframe);
+  const doc=iframe.contentWindow.document;
+  doc.open();
+  doc.write(`<!doctype html><html><head><title>Requisição de Materiais</title><style>${reqPrintCss()}</style></head><body>${html}</body></html>`);
+  doc.close();
+  setTimeout(()=>{ iframe.contentWindow.focus(); iframe.contentWindow.print(); setTimeout(()=>{ document.body.removeChild(iframe); document.title=oldTitle; },800); },350);
+};
+
+const ensureV161UIV18 = ensureV161UI;
+ensureV161UI = function(){
+  ensureV161UIV18();
+  if(!document.getElementById('v181-req-style')){
+    const st=document.createElement('style'); st.id='v181-req-style'; st.textContent=`
+      .req-print-wrap{max-width:100%!important}
+      .req-doc{font-size:12px}
+      .req-head-main{background:#1e2a3a!important;color:#fff!important;padding:16px 24px;font-size:26px;font-weight:800}
+      .req-head-sub{background:#1e2a3a!important;color:#fff!important;border-top:10px solid #fff;padding:8px 24px;font-size:12px}
+      .req-table{width:100%;border-collapse:collapse;margin-top:10px;table-layout:fixed}
+      .req-table th{background:#1e2a3a!important;color:#fff!important;padding:8px 6px;border:1px solid #1e2a3a;text-align:center!important}
+      .req-table td{border-bottom:1px solid #eef2f7;padding:6px 8px;vertical-align:middle}
+      .req-section-title{text-align:left!important}
+      .req-table input,.req-table textarea{width:100%;border:1px solid #cbd5e1;border-radius:6px;padding:7px 9px;font-size:13px;background:#fff;color:#1e293b;font-family:Arial,sans-serif}
+      .req-table textarea{resize:vertical;min-height:34px;line-height:1.25}
+      .req-col-desc textarea{min-height:30px}
+      .req-col-num,.req-col-ok{text-align:center}
+      .req-col-total{text-align:right;font-weight:800;white-space:nowrap}
+      .req-total-row td{background:#1e2a3a!important;color:#fff!important;font-weight:800!important;text-align:right!important}
+      .req-profit{background:#16a34a!important;color:#fff!important;font-weight:800!important}
+      .req-sign{display:flex;justify-content:space-around;margin-top:32px;text-align:center;font-size:11px}
+    `;
+    document.head.appendChild(st);
+  }
+};
+
+
 // INIT
 document.querySelectorAll('.ov').forEach(o=>o.addEventListener('click',e=>{ if(e.target===o) o.classList.remove('open'); }));
 if('serviceWorker' in navigator) window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').catch(()=>{}));
